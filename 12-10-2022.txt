@@ -41,7 +41,7 @@ I cannot find the problems when we laod the data. I got NAN in tensor after some
 (11). For for loop
 In the Surface, I can just cut the center point out of the neighbor points. 
 # neighborhood=xyz.view(batch_size * num_points, -1)[idx,:] (no center)
-(need to add:groupping method) (forgot to using sorted index to group umbrella?)
+(need to add:groupping method) (forgot to using sorted index to group umbrella? anticlockwise)
 
 (12). How to confirm the number of K.
 Original MAE: K=32  ,input point (batchsize, 2048, 3)
