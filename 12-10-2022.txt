@@ -1,4 +1,4 @@
-(1). Modifying the layers in mlp/encoder/transformer does not prevent NAN occurring.
+(1). simplifying the layers in mlp/encoder/transformer does not prevent NAN occurring.
 
 (2). Double check the tensor with batchsize 1. 
 # new_feature = torch.cat([group_center, group_polar, group_normal, group_pos], dim=-1)
