@@ -1,0 +1,13 @@
+(1). Modifying the layers in mlp/encoder/transformer does not prevent NAN occurring.
+
+(2). Double check the tensor with batchsize 1. 
+# new_feature = torch.cat([group_center, group_polar, group_normal, group_pos], dim=-1)
+During the process of generating new_feature(10 channels: x, y, z, polar1, polar2, polar3, norm_x, norm_y, norm_z, pos),
+there will be a tensor with all the 0 value in (norm_x, norm_y, norm_z, pos) position.
+
+(3). Double check the process of selecting centers (using FPS) and neighborhoods (using KNN)
+It was found that each of the 32 neighborhoods of a point cloud had the same coordiates as the center. 
+So, all the value will be 0 when we do neighborhoods normalization (neighborhoods-center).So, we cannot calculate the norm vector with [0,0,0].
+We can obtain right center position and polar information, but all the norm vactors and pos feature are NAN.
+
+(4). 
