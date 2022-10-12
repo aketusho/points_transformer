@@ -6,9 +6,27 @@ During the process of generating new_feature(10 channels: x, y, z, polar1, polar
 there will be a tensor with all the 0 value in (norm_x, norm_y, norm_z, pos) position.
 
 (3). Double check the process of selecting centers (using FPS) and neighborhoods (using KNN)
-It was found that each of the 32 neighborhoods of a point cloud had the same coordiates as the center. 
+It was found that each of the 32 neighborhoods of a point cloud had the same coordiates as the center.(not every point cloud) 
+Sometimes we got same neighborhoods coordinates from differnet neighborhoods indexs.
 So, all the value will be 0 when we do neighborhoods normalization (neighborhoods-center).So, we cannot calculate the norm vector with [0,0,0].
 We can obtain right center position and polar information, but all the norm vactors and pos feature are NAN.
 
-(4). The return value of KNN includes center point.
-So, I used KNN algorithm in the Surface instead of the KNN algorithm in the MAE
+(4). There is no NAN (in loss) in pretraining. There my be a problem with the dataset. (pre: ShapeNet / fine: ScanObjectNN)
+
+(5). The return value of KNN includes center point.(not every point cloud)
+We use the x,y,z coordinates in the MAE direcctly (do not need to calculate norm vectors), so original MAE did not report errors.
+Therefore, I used KNN algorithm in the Surface instead of the KNN algorithm in the MAE. (The return value contains the center)(not every point cloud).
+(All the KNN algorithms in MAE and Surface compiled from C++)
+?: The return value of KNN should be the nearest K points near the center point (It should not include the center point itself)
+Still got NAN (neighbor position as same as center)
+
+(6). Using the FPS algorithm in the Surface instead of the FPS algorithm in the MAE. (Still got NAN, neighbor position as same as center)
+
+(7). For loop, replacing the neighbor point (which has the same value as center) with the point closest to center (keep the number of neighbors K the same)
+
+(8). There is no NAN in "new_feature" (check NAN)
+I can successfully run through the training dataset(small one, 20%).
+But after transformer module, still got NAN in validation and test dataset (I used test data instead of val data, still have problems).
+It means that there is NAN in the tensor after pos_embedding module.
+
+(9).Back to check.
