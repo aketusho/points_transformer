@@ -13,6 +13,7 @@ from tools import pretrain_run_net as pretrain
 from tools import finetune_run_net as finetune
 from tools import test_run_net as test_net
 from utils import  parser,dist_utils, misc
+
 from utils.logger import *
 from utils.config import *
 
@@ -39,10 +40,14 @@ import os
 import argparse
 from pathlib import Path
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default="./cfgs/pretrain.yaml", help='yaml config file')
+    parser.add_argument('--cuda_ops', action='store_true', default=True,
+                        help='Whether to use cuda version operations [default: False]')
+    parser.add_argument('--config', type=str, default="./cfgs/finetune_scan_hardest.yaml", help='yaml config file')
     #./cfgs/finetune_scan_hardest.yaml
     #./cfgs/pretrain.yaml
 
@@ -52,17 +57,19 @@ def get_args():
     parser.add_argument('--num_workers', type=int, default=0)
     # seed
     parser.add_argument('--seed', type=int, default=0, help='random seed')
-    parser.add_argument('--deterministic', default=True, action='store_true',
-                        help='whether to set deterministic options for CUDNN backend.')
+    parser.add_argument('--deterministic', default=True, action='store_true',help='whether to set deterministic options for CUDNN backend.')
+
 
     # bn
     parser.add_argument('--sync_bn', action='store_true', default=False, help='whether to use sync bn')
     # some args
-    parser.add_argument('--exp_name', type=str, default='ScanObjectNN', help='experiment name')
+    parser.add_argument('--exp_name', type=str, default='ScanObjectNN_New', help='experiment name') #ScanObjectNN ShapeNet
     parser.add_argument('--loss', type=str, default='cd1', help='loss name')
     parser.add_argument('--start_ckpts', type=str, default=None, help='reload used ckpt path')
-    parser.add_argument('--ckpts', type=str, default="./experiments/pretrain/cfgs/ScanObjectNN/ckpt-last.pth",
-                        help='test used ckpt path')  #
+    parser.add_argument('--ckpts', type=str, default=None, help='test used ckpt path')
+
+    #pretrained model ShapeNet
+    "./experiments/pretrain/cfgs/ShapeNet_New/ckpt-last.pth"
     # ./experiments/pretrain/cfgs/ScanObjectNN/ckpt-last.pth
     # ./pretrainedmodels/pretrain.pth
     parser.add_argument('--val_freq', type=int, default=1, help='test freq')
@@ -70,8 +77,8 @@ def get_args():
     parser.add_argument('--resume', action='store_true', default=False,
                         help='autoresume training (interrupted by accident)')
     parser.add_argument('--test', action='store_true', default=False, help='test mode for certain ckpt')
-    parser.add_argument('--finetune_model', action='store_true', default=False,
-                        help='finetune modelnet with pretrained weight')
+    parser.add_argument('--finetune_model', action='store_true', default=True,
+                        help='finetune modelnet with pretrained weight') #False 是pretrain
     # if pretrain(finetune_model), False, otherwise True
     parser.add_argument('--scratch_model', action='store_true', default=False, help='training modelnet from scratch')
     parser.add_argument('--mode', choices=['easy', 'median', 'hard', None], default=None,
@@ -105,6 +112,81 @@ def get_args():
     args.log_name = Path(args.config).stem
     create_experiment_dir(args)
     return args
+
+def merge_new_config(config, new_config):
+    for key, val in new_config.items():
+        if not isinstance(val, dict):
+            if key == '_base_':
+                with open(new_config['_base_'], 'r') as f:
+                    try:
+                        val = yaml.load(f, Loader=yaml.FullLoader)
+                    except:
+                        val = yaml.load(f)
+                config[key] = EasyDict()
+                merge_new_config(config[key], val)
+            else:
+                config[key] = val
+                continue
+        if key not in config:
+            config[key] = EasyDict()
+        merge_new_config(config[key], val)
+    return config
+
+def build_opti_sche(base_model, config):
+    opti_config = config.optimizer
+    if opti_config.type == 'AdamW':  # this way
+        def add_weight_decay(model, weight_decay=1e-5, skip_list=()):
+            decay = []
+            no_decay = []
+            for name, param in model.module.named_parameters():
+                if not param.requires_grad:
+                    continue  # frozen weights
+                if len(param.shape) == 1 or name.endswith(".bias") or 'token' in name or name in skip_list:
+                    # print(name)
+                    no_decay.append(param)
+                else:
+                    decay.append(param)
+            return [
+                {'params': no_decay, 'weight_decay': 0.},
+                {'params': decay, 'weight_decay': weight_decay}]
+
+        param_groups = add_weight_decay(base_model, weight_decay=opti_config.kwargs.weight_decay)
+        optimizer = optim.AdamW(param_groups, **opti_config.kwargs)
+    elif opti_config.type == 'Adam':
+        optimizer = optim.Adam(base_model.parameters(), **opti_config.kwargs)
+    elif opti_config.type == 'SGD':
+        optimizer = optim.SGD(base_model.parameters(), nesterov=True, **opti_config.kwargs)
+    else:
+        raise NotImplementedError()
+
+    sche_config = config.scheduler
+    if sche_config.type == 'LambdaLR':
+        scheduler = build_lambda_sche(optimizer, sche_config.kwargs)  # misc.py
+    elif sche_config.type == 'CosLR':
+        scheduler = CosineLRScheduler(optimizer,
+                                      t_initial=sche_config.kwargs.epochs,
+                                      t_mul=1,
+                                      lr_min=1e-6,
+                                      decay_rate=0.1,
+                                      warmup_lr_init=1e-3, #1e-6
+                                      warmup_t=sche_config.kwargs.initial_epochs,
+                                      cycle_limit=1,
+                                      t_in_epochs=True)
+    elif sche_config.type == 'StepLR':
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 50, gamma = 0.1, last_epoch = -1)
+        #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, **sche_config.kwargs)
+    elif sche_config.type == 'function':
+        scheduler = None
+    else:
+        raise NotImplementedError()
+
+    if config.get('bnmscheduler') is not None:
+        bnsche_config = config.bnmscheduler
+        if bnsche_config.type == 'Lambda':
+            bnscheduler = build_lambda_bnsche(base_model, bnsche_config.kwargs)  # misc.py
+        scheduler = [scheduler, bnscheduler]
+
+    return optimizer, scheduler
 def cfg_from_yaml_file(cfg_file):
     config = EasyDict()
     with open(cfg_file, 'r') as f:
@@ -112,6 +194,7 @@ def cfg_from_yaml_file(cfg_file):
             new_config = yaml.load(f, Loader=yaml.FullLoader)
         except:
             new_config = yaml.load(f)
+
     merge_new_config(config=config, new_config=new_config)
     return config
 
@@ -393,11 +476,13 @@ def dataset_builder(args, config):
                                                 worker_init_fn=worker_init_fn)
     return sampler, dataloader
 
+#print("run net strat!!")
 def run_net(args, config, train_writer=None, val_writer=None):
+   
     logger = get_logger(args.log_name)
     # build dataset
     (train_sampler, train_dataloader), (_, test_dataloader), = builder.dataset_builder(args, config.dataset.train), \
-                                                               builder.dataset_builder(args, config.dataset.val)
+                                                               builder.dataset_builder(args, config.dataset.test)
     # build model
     base_model = builder.model_builder(config.model)#
 
@@ -413,7 +498,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
         best_metrics = Acc_Metric(best_metrics)
     else:
         #if args.ckpts is not None:
-        if args.ckpts == None: #MAE=,Transformer!=
+        if args.ckpts != None: #MAE=,Transformer!=
+            print("where is pretrained model ",args.ckpts)
             base_model.load_model_from_ckpt(args.ckpts)
         else:
             print_log('Training from scratch', logger=logger)
@@ -433,7 +519,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
         print_log('Using Data parallel ...', logger=logger)
         base_model = nn.DataParallel(base_model).cuda()
     # optimizer & scheduler
-    optimizer, scheduler = builder.build_opti_sche(base_model, config)
+    optimizer, scheduler = builder.build_opti_sche(base_model, config)#
 
     if args.resume:
         builder.resume_optimizer(optimizer, args, logger=logger)
@@ -456,78 +542,110 @@ def run_net(args, config, train_writer=None, val_writer=None):
         n_batches = len(train_dataloader)
 
         npoints = config.npoints
+
+        want_label = torch.zeros((config.total_bs), dtype=torch.int64);
+        want_label = want_label.cuda()
+        num_batch = 0;
+
         for idx, (taxonomy_ids, model_ids, data) in enumerate(train_dataloader):
-            # print("taxonomy_ids",taxonomy_ids);
-            # print("model_ids",model_ids);
-            # print("data:",data)
-            num_iter += 1
-            n_itr = epoch * n_batches + idx
+            #print("problem")
+            ground_truth_label = data[1];
+            ground_truth_label=ground_truth_label.cuda()
+            if torch.equal(ground_truth_label, want_label):
+                if (num_batch < 4): #32*6=192 4*8*6=192 32*4=
+                    print("------ground label:-----", ground_truth_label);
 
-            data_time.update(time.time() - batch_start_time)
+                    num_batch = num_batch+1;
+                    num_iter += 1
+                    n_itr = epoch * n_batches + idx
 
-            points = data[0].cuda()
-            label = data[1].cuda()
+                    data_time.update(time.time() - batch_start_time)
 
-            if npoints == 1024:
-                point_all = 1200
-            elif npoints == 2048:
-                point_all = 2400
-            elif npoints == 4096:
-                point_all = 4800
-            elif npoints == 8192:
-                point_all = 8192
+                    points = data[0].cuda()
+                    label = data[1].cuda()
+
+                    if npoints == 1024:
+                        point_all = 1200
+                    elif npoints == 2048:
+                        point_all = 2400
+                    elif npoints == 4096:
+                        point_all = 4800
+                    elif npoints == 8192:
+                        point_all = 8192
+                    else:
+                        raise NotImplementedError()
+
+                    if points.size(1) < point_all:
+                        point_all = points.size(1)
+
+                    fps_idx = pointnet2_utils.furthest_point_sample(points, point_all)  # (B, npoint)
+                    fps_idx = fps_idx[:, np.random.choice(point_all, npoints, False)]
+                    points = pointnet2_utils.gather_operation(points.transpose(1, 2).contiguous(), fps_idx).transpose(1,2).contiguous()  # (B, N, 3)
+
+                    # import pdb; pdb.set_trace()
+                    points = train_transforms(points)
+                    #print("hello, stephanie")
+                    if num_batch==5 or num_batch== 6:
+                        print("*******")
+
+                    ret = base_model(points,num_batch);
+                    
+                    #print("current learning rate", scheduler.get_last_lr()[0])
+                    if num_batch==5:
+                        print("vector score:",ret);
+                        print("*******")
+
+
+                    #print("ret",ret.shape)
+
+                    loss, acc = base_model.module.get_loss_acc(ret, label)
+
+                    _loss = loss
+
+                    _loss.backward()
+                    optimizer.step()
+                    base_model.zero_grad()
+                    print("current batch loss",loss.item())
+                    # forward
+                    # if num_iter == config.step_per_update:
+                    #     if config.get('grad_norm_clip') is not None:
+                    #         torch.nn.utils.clip_grad_norm_(base_model.parameters(), config.grad_norm_clip, norm_type=2)
+                    #     num_iter = 0
+                    #     optimizer.step()
+                    #     base_model.zero_grad()
+
+                    if args.distributed:
+                        loss = dist_utils.reduce_tensor(loss, args)
+                        acc = dist_utils.reduce_tensor(acc, args)
+                        losses.update([loss.item(), acc.item()])
+                    else:
+                        losses.update([loss.item(), acc.item()])
+
+                    # if args.distributed:
+                    #     torch.cuda.synchronize()
+
+                    if train_writer is not None:
+                        train_writer.add_scalar('Loss/Batch/Loss', loss.item(), n_itr)
+                        train_writer.add_scalar('Loss/Batch/TrainAcc', acc.item(), n_itr)
+                        train_writer.add_scalar('Loss/Batch/LR', optimizer.param_groups[0]['lr'], n_itr)
+
+                    batch_time.update(time.time() - batch_start_time)
+                    batch_start_time = time.time()
+                else:
+                    num_batch = 0;
+                    want_label = torch.add(want_label, 1);
+                    #print("wanted label", want_label);
             else:
-                raise NotImplementedError()
+                pass
 
-            if points.size(1) < point_all:
-                point_all = points.size(1)
 
-            fps_idx = pointnet2_utils.furthest_point_sample(points, point_all)  # (B, npoint)
-            fps_idx = fps_idx[:, np.random.choice(point_all, npoints, False)]
-            points = pointnet2_utils.gather_operation(points.transpose(1, 2).contiguous(), fps_idx).transpose(1,2).contiguous()  # (B, N, 3)
+                    # if idx % 10 == 0:
+                    #     print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Loss+Acc = %s lr = %.6f' %
+                    #                 (epoch, config.max_epoch, idx + 1, n_batches, batch_time.val(), data_time.val(),
+                    #                 ['%.4f' % l for l in losses.val()], optimizer.param_groups[0]['lr']), logger = logger)
 
-            # import pdb; pdb.set_trace()
-            points = train_transforms(points)
-            print("hello, stephanie")
-            ret = base_model(points);
-            print("ret",ret.shape)
+        #print("lalallalalalalal")
 
-            loss, acc = base_model.module.get_loss_acc(ret, label)
-
-            _loss = loss
-
-            _loss.backward()
-
-            # forward
-            if num_iter == config.step_per_update:
-                if config.get('grad_norm_clip') is not None:
-                    torch.nn.utils.clip_grad_norm_(base_model.parameters(), config.grad_norm_clip, norm_type=2)
-                num_iter = 0
-                optimizer.step()
-                base_model.zero_grad()
-
-            if args.distributed:
-                loss = dist_utils.reduce_tensor(loss, args)
-                acc = dist_utils.reduce_tensor(acc, args)
-                losses.update([loss.item(), acc.item()])
-            else:
-                losses.update([loss.item(), acc.item()])
-
-            if args.distributed:
-                torch.cuda.synchronize()
-
-            if train_writer is not None:
-                train_writer.add_scalar('Loss/Batch/Loss', loss.item(), n_itr)
-                train_writer.add_scalar('Loss/Batch/TrainAcc', acc.item(), n_itr)
-                train_writer.add_scalar('Loss/Batch/LR', optimizer.param_groups[0]['lr'], n_itr)
-
-            batch_time.update(time.time() - batch_start_time)
-            batch_start_time = time.time()
-
-            # if idx % 10 == 0:
-            #     print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Loss+Acc = %s lr = %.6f' %
-            #                 (epoch, config.max_epoch, idx + 1, n_batches, batch_time.val(), data_time.val(),
-            #                 ['%.4f' % l for l in losses.val()], optimizer.param_groups[0]['lr']), logger = logger)
         if isinstance(scheduler, list):
             for item in scheduler:
                 item.step(epoch)
@@ -543,11 +661,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
                    optimizer.param_groups[0]['lr']), logger=logger)
 
         if epoch % args.val_freq == 0 and epoch != 0:
-            # Validate the current model
+            #Validate the current model
             metrics = validate(base_model, test_dataloader, epoch, val_writer, args, config, logger=logger)
 
             better = metrics.better_than(best_metrics)
-            # Save ckeckpoints
+            #Save ckeckpoints
             if better:
                 best_metrics = metrics
                 builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args,
@@ -564,8 +682,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
                         print_log(
                             "****************************************************************************************",
                             logger=logger)
-                        builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics_vote,
-                                                'ckpt-best_vote', args, logger=logger)
+                        builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics_vote,'ckpt-best_vote', args, logger=logger)
+
 
         builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger)
         # if (config.max_epoch - epoch) < 10:
@@ -620,6 +738,8 @@ def main():
     # config
     print("config")
     config = get_config(args, logger = logger)
+   
+    #print("whether extra train", config.dataset.get('extra_train'))
 
     # batch size
     if args.distributed:#False
@@ -635,7 +755,7 @@ def main():
         if config.dataset.get('extra_train'):#False
             config.dataset.extra_train.others.bs = config.total_bs * 2
         config.dataset.val.others.bs = config.total_bs * 2
-        if config.dataset.get('test'):
+        if config.dataset.get('test'):#True
             config.dataset.test.others.bs = config.total_bs 
     # log 
     log_args_to_file(args, 'args', logger = logger)
@@ -662,10 +782,13 @@ def main():
     if args.test: #False
         test_net(args, config)
     else:
+        print("what is pretrained model:",config.model)
         # args.fineture_model==True; args.scratch_model==False
         if args.finetune_model or args.scratch_model:#True
-            run_net(args, config, train_writer, val_writer)
+            print("run net!!")
+            run_net(args, config, train_writer, val_writer) #fineturn this way
         else: # if pretrain this way
+            print("pretrain .................................")
             pretrain(args, config, train_writer, val_writer)
 
 
