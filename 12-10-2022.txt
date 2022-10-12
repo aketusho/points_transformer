@@ -10,4 +10,5 @@ It was found that each of the 32 neighborhoods of a point cloud had the same coo
 So, all the value will be 0 when we do neighborhoods normalization (neighborhoods-center).So, we cannot calculate the norm vector with [0,0,0].
 We can obtain right center position and polar information, but all the norm vactors and pos feature are NAN.
 
-(4). 
+(4). The return value of KNN includes center point.
+So, I used KNN algorithm in the Surface instead of the KNN algorithm in the MAE
